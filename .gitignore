@@ -1,0 +1,23 @@
+build/
+*.o
+*.exe
+
+# Wikipedia dumps and extracted text (download via data/download_*.ps1)
+spatial_ai/data/*.bz2
+spatial_ai/data/*.xml
+spatial_ai/data/*.tar.gz
+spatial_ai/data/extracted_*/
+spatial_ai/data/stsbenchmark/
+spatial_ai/data/wiki_[0-9]*
+spatial_ai/data/wiki_*.txt
+spatial_ai/data/sample_*.txt
+spatial_ai/data/stsb.tsv
+spatial_ai/data/stsb_sample.tsv
+spatial_ai/data/sample_test.txt
+spatial_ai/data/qa.tsv
+spatial_ai/data/qa_*.tsv
+spatial_ai/data/qa_*.txt
+spatial_ai/data/squad*.json
+
+# Saved model files (produced by ai_save / --save)
+*.spai
