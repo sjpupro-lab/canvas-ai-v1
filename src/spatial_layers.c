@@ -5,6 +5,18 @@ static int is_space_byte(uint8_t c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
+/* Content-word gate for the morpheme layer.
+ *
+ * SPEC §3.1 lists "어근/조사/어미" (root/particle/ending) all as
+ * morphemes, which would imply the morpheme layer stamps every
+ * morpheme token regardless of POS. Empirically that uniformly
+ * amplifies function-word bytes (가/을/는다/.) shared by every
+ * Korean clause, which dominates the refinement aggregation and
+ * yields Frankenstein syllables (e.g. "닔"/"쥸") on the 18-clause
+ * seed corpus. Restricting the layer to content morphemes (NOUN,
+ * VERB, ADJ, UNKNOWN) keeps grammatical particles at base-layer
+ * weight only and preserves substitution quality. Documented
+ * divergence from SPEC §3.1. */
 static int pos_is_content(PartOfSpeech pos) {
     return pos == POS_NOUN || pos == POS_VERB || pos == POS_ADJ || pos == POS_UNKNOWN;
 }
@@ -27,7 +39,13 @@ static void seed_rgb_token(SpatialGrid* grid, uint32_t idx, PartOfSpeech pos) {
         case POS_VERB:     r_seed = 120; g_seed = 40;  b_seed = 140; break;
         case POS_ADJ:      r_seed = 170; g_seed = 35;  b_seed = 180; break;
         case POS_PARTICLE: r_seed = 8;   g_seed = 85;  b_seed = 90;  break;
-        case POS_ENDING:   r_seed = 12;  g_seed = 95;  b_seed = 110; break;
+        /* SPEC §5.3: function words live in R ∈ [0, 9]. The previous
+         * R=12 placed endings in the "concrete noun" range [10-49],
+         * so a content-noun seed was being averaged against an
+         * ending seed at overlapping byte positions, muddying the
+         * R-channel semantic signal. R=6 keeps endings separable
+         * from particles (R=8) and punctuation (R=5). */
+        case POS_ENDING:   r_seed = 6;   g_seed = 95;  b_seed = 110; break;
         case POS_PUNCT:    r_seed = 5;   g_seed = 120; b_seed = 60;  break;
         case POS_UNKNOWN:  r_seed = 210; g_seed = 20;  b_seed = 200; break;
     }

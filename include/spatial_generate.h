@@ -116,4 +116,80 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
                           char* out, uint32_t max_out,
                           float* out_match_similarity);
 
+/* ── Top-K weighted aggregation ─────────────────────────── */
+
+/* Default number of keyframes to aggregate over during refinement. */
+#define GEN_TOPK_DEFAULT 16
+#define GEN_TOPK_MAX     32
+
+/* Maximum number of refinement iterations ai_generate_refine runs.
+ * Each pass re-evaluates every row against the current candidate
+ * grid; early-exits when the number of row changes drops below
+ * GEN_REFINE_CONVERGE. */
+#define GEN_REFINE_ITERS      4
+#define GEN_REFINE_CONVERGE   2
+
+/* Morpheme-boundary stickiness bonus for character-level refinement.
+ * When two adjacent characters lie inside the same word, the previous
+ * character's source KF earns a bonus proportional to the row's total
+ * aggregated mass (≈5% of a typical span score). Keeps same-word
+ * output coherent without dominating a clearly better source. */
+#define GEN_STICKY_BONUS_FRAC 0.05
+
+/* Build aggregated tables from only the specified keyframe ids,
+ * weighted by the matching scores (0..1). When scores == NULL, every
+ * id is weighted equally at 1.0.
+ *
+ *   - use_next_in_topic == 0  → aggregate the given keyframes directly
+ *                               (their pattern shape becomes the prior).
+ *   - use_next_in_topic == 1  → aggregate ai_next_in_topic(id) for each
+ *                               id. This is the "what should come next"
+ *                               prior used by ai_generate_refine.
+ *
+ * Returns NULL if ai is NULL or ids is NULL or count == 0. */
+AggTables* agg_build_topk(const SpatialAI* ai,
+                          const uint32_t* ids, const float* scores,
+                          uint32_t count, int use_next_in_topic);
+
+/* ── Spatial pattern similarity ──────────────────────────
+ * Per-pixel neighborhood bonus for byte scoring (spec §3.2, §4.3):
+ *
+ *   - Cluster coherence: how close (y, v)'s R/G/B in AggTables is to
+ *     its 8-neighbor cells' R/G/B (active cells only).
+ *   - Input agreement:   where the input grid has activity near
+ *     (y, v), how close its R/G/B is to the AggTable's center color.
+ *
+ * Returns a score in [0, 1]. Returns 0.5 (neutral) when no neighbor
+ * data is available, so scoring doesn't collapse for isolated cells. */
+double spatial_pattern_score(const AggTables* t, uint32_t y, uint8_t v,
+                             const SpatialGrid* input);
+
+/* Full byte-candidate score:
+ *   score = A × R_sim × G_sim × B_sim × (0.5 + 0.5 × spatial)
+ *
+ * The spatial term is smoothed to [0.5, 1.0] so an isolated-but-clear
+ * RGBA match never hits zero from a missing neighborhood. Returns 0
+ * when the (y, v) cell has no aggregated activity. */
+double agg_score_byte_full(const AggTables* t, uint32_t y, uint8_t v,
+                           double in_R, double in_G, double in_B,
+                           const SpatialGrid* input);
+
+/* ── Refinement-based generation ────────────────────────
+ * Implements the target pipeline from spec §3.1 / §3.4:
+ *
+ *   input text
+ *     → grid encode
+ *     → top-k keyframe retrieval (MATCH_GENERATE)
+ *     → AggTables built from top-k's NEXT-in-topic frames
+ *     → initial candidate grid (row-argmax over AggTables)
+ *     → iterate: rescore each row with RGB + spatial + delta
+ *     → decode candidate (UTF-8) → out
+ *
+ * On convergence or GEN_REFINE_ITERS exceeded, emits the current
+ * candidate. Returns bytes written. out_match_similarity receives
+ * the best top-k score (NULL to skip). */
+uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
+                            char* out, uint32_t max_out,
+                            float* out_match_similarity);
+
 #endif /* SPATIAL_GENERATE_H */

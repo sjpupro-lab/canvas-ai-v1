@@ -20,7 +20,7 @@ SRCS = $(SRC_DIR)/spatial_grid.c \
 
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
-TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle
+TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_generate_refine
 
 .PHONY: all clean test gpu_train_help
 
@@ -79,6 +79,9 @@ $(BUILD_DIR)/test_adaptive: $(TEST_DIR)/test_adaptive.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/test_subtitle: $(TEST_DIR)/test_subtitle.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/test_generate_refine: $(TEST_DIR)/test_generate_refine.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
 # ─── Wikipedia integration test (manual run) ─────────────────
 $(BUILD_DIR)/test_wiki: $(TEST_DIR)/test_wiki.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
@@ -124,6 +127,20 @@ $(BUILD_DIR)/stream_train: tools/stream_train.c $(OBJS) | $(BUILD_DIR)
 # ─── Interactive chat REPL ───────────────────────────────────────
 $(BUILD_DIR)/chat: tools/chat.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+# ─── Refinement generation verifier ──────────────────────────────
+$(BUILD_DIR)/verify_refine: tools/verify_refine.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+verify_refine: $(BUILD_DIR)/verify_refine
+	./$(BUILD_DIR)/verify_refine
+
+# ─── PR #2 end-to-end verifier (base_patterns + wiki5k + sample_en) ──
+$(BUILD_DIR)/verify_pr2: tools/verify_pr2.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+verify_pr2: $(BUILD_DIR)/verify_pr2
+	./$(BUILD_DIR)/verify_pr2
 
 chat: $(BUILD_DIR)/chat
 	@echo "Built chat. Example:"
