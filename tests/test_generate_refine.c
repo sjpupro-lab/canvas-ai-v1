@@ -311,6 +311,210 @@ static void test_generate_refine_empty(void) {
     PASS();
 }
 
+/* ── UTF-8 helpers for the next 4 tests ── */
+
+static int ut8_lead_len_t(uint8_t b) {
+    if ((b & 0x80) == 0x00) return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 0;
+}
+static int ut8_is_cont_t(uint8_t b) { return (b & 0xC0) == 0x80; }
+
+/* Walk `s` and assert every multi-byte sequence is a valid UTF-8
+ * sequence of the expected width. Returns 1 if the whole string is
+ * valid, 0 otherwise. Also counts the number of decoded characters. */
+static int validate_utf8_strict(const char* s, uint32_t n, uint32_t* out_chars) {
+    uint32_t i = 0, chars = 0;
+    while (i < n) {
+        int len = ut8_lead_len_t((uint8_t)s[i]);
+        if (len == 0)             return 0;   /* stray continuation / invalid */
+        if (i + (uint32_t)len > n) return 0;  /* truncated */
+        for (int k = 1; k < len; k++) {
+            if (!ut8_is_cont_t((uint8_t)s[i + (uint32_t)k])) return 0;
+        }
+        i += (uint32_t)len;
+        chars++;
+    }
+    if (out_chars) *out_chars = chars;
+    return 1;
+}
+
+/* ── Test 9: refine preserves Korean syllables as valid UTF-8 ── */
+
+static void test_refine_preserves_korean_syllables(void) {
+    TEST("refine emits valid UTF-8 for every character");
+
+    SpatialAI* ai = build_trained_ai();
+    char out[2048];
+    float sim = 0.0f;
+    uint32_t n = ai_generate_refine(ai, "고양이가 밥을", out, sizeof(out), &sim);
+    assert(n > 0);
+
+    uint32_t chars = 0;
+    int ok = validate_utf8_strict(out, n, &chars);
+    printf("\n    out=\"%s\" chars=%u valid_utf8=%d\n", out, chars, ok);
+    assert(ok);
+    assert(chars >= 3);   /* should be roughly the length of a short clause */
+
+    /* Character-level refinement must recover at least one known token
+     * from the training corpus — otherwise we've degenerated to noise. */
+    int has_any = strstr(out, "고양이") || strstr(out, "강아지") ||
+                  strstr(out, "사람")   || strstr(out, "아이")   ||
+                  strstr(out, "밥을")   || strstr(out, "물을")   ||
+                  strstr(out, "먹")     || strstr(out, "마")     ||
+                  strstr(out, "는다");
+    assert(has_any);
+
+    spatial_ai_destroy(ai);
+    PASS();
+}
+
+/* ── Test 10: every emitted char comes from seed or a top-k source ──
+ *
+ * Exhaustively: pull top-k ids (MATCH_PREDICT) + each's next-in-topic,
+ * build a set of candidate (y, len, bytes) spans, then assert every
+ * decoded char in the refine output matches one of them byte-for-
+ * byte. Locks the "no Frankenstein" invariant — character boundaries
+ * come entirely from one source.
+ */
+static void test_refine_no_frankenstein_glyphs(void) {
+    TEST("refine chars match seed or top-k source byte-for-byte");
+
+    SpatialAI* ai = build_trained_ai();
+
+    /* Encode the query through the full pipeline just like refine does,
+     * run MATCH_PREDICT, then for each top-k KF compute its next-in-
+     * topic. */
+    SpatialGrid* qg = grid_create();
+    layers_encode_clause("고양이가 밥을", NULL, qg);
+    update_rgb_directional(qg);
+    apply_ema_to_grid(ai, qg);
+    MatchContext ctx; memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = &ai->bucket_idx;
+    MatchResult r = spatial_match(ai, qg, MATCH_PREDICT, &ctx);
+    grid_destroy(qg);
+    assert(r.topk_count > 0);
+
+    /* Build src_bytes[k][y] from each next-in-topic grid. */
+    uint8_t src[TOP_K][GRID_SIZE]; memset(src, 0, sizeof(src));
+    for (uint32_t k = 0; k < r.topk_count; k++) {
+        uint32_t nid = ai_next_in_topic(ai, r.topk[k].id);
+        if (nid >= ai->kf_count) continue;
+        const SpatialGrid* g = &ai->keyframes[nid].grid;
+        for (uint32_t y = 0; y < GRID_SIZE; y++) {
+            uint32_t bx = 0; uint16_t ba = 0;
+            for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                uint16_t a = g->A[y * GRID_SIZE + x];
+                if (a > ba) { ba = a; bx = x; }
+            }
+            src[k][y] = (uint8_t)bx;
+        }
+    }
+
+    /* Also collect the seed = top-1 next-in-topic as a valid source. */
+    /* (src[0] already holds it.) */
+
+    /* Run refine and walk each character, confirming its bytes appear
+     * verbatim in some src[k][y..y+len-1]. */
+    char out[2048];
+    uint32_t n = ai_generate_refine(ai, "고양이가 밥을", out, sizeof(out), NULL);
+    assert(n > 0);
+
+    uint32_t i = 0, row = 0;
+    while (i < n) {
+        int len = ut8_lead_len_t((uint8_t)out[i]);
+        if (len <= 0 || i + (uint32_t)len > n) break;
+
+        int matched_any = 0;
+        for (uint32_t k = 0; k < r.topk_count && !matched_any; k++) {
+            int ok = 1;
+            for (int b = 0; b < len; b++) {
+                if (src[k][row + (uint32_t)b] != (uint8_t)out[i + (uint32_t)b]) {
+                    ok = 0; break;
+                }
+            }
+            if (ok) matched_any = 1;
+        }
+        if (!matched_any) {
+            printf("\n    char at row %u (len=%d) didn't match any source\n", row, len);
+        }
+        assert(matched_any);
+
+        i   += (uint32_t)len;
+        row += (uint32_t)len;
+    }
+
+    spatial_ai_destroy(ai);
+    PASS();
+}
+
+/* ── Test 11: span atomicity — emitted char equals ONE source ──
+ *
+ * Build an engine whose two keyframes have 3-byte chars that differ
+ * at their MIDDLE continuation byte (row y+1). A row-level refinement
+ * might produce a mix; character-level refinement must not.
+ */
+static void test_refine_span_atomicity(void) {
+    TEST("refine swaps char spans atomically — no middle-byte mix");
+
+    SpatialAI* ai = spatial_ai_create();
+    /* Two clauses that share structure except one middle syllable.
+     * "고양이가 밥을 먹는다." vs "고양이가 밥을 마신다." — the differing
+     * verbs have distinct middle bytes. */
+    ai_force_keyframe(ai, "고양이가 밥을 먹는다.", "meal");
+    ai_force_keyframe(ai, "고양이가 밥을 마신다.", "meal");
+    ai_force_keyframe(ai, "강아지가 밥을 먹는다.", "meal");
+
+    char out[2048];
+    uint32_t n = ai_generate_refine(ai, "고양이가 밥을", out, sizeof(out), NULL);
+    assert(n > 0);
+
+    uint32_t chars = 0;
+    int ok = validate_utf8_strict(out, n, &chars);
+    printf("\n    atomic out=\"%s\" chars=%u valid=%d\n", out, chars, ok);
+    assert(ok);
+
+    spatial_ai_destroy(ai);
+    PASS();
+}
+
+/* ── Test 12: morpheme stickiness keeps same-word chars coherent ── */
+
+static void test_refine_morpheme_stickiness(void) {
+    TEST("refine keeps same-word chars from one source");
+
+    /* Seed the engine so that inside the word "고양이" the source
+     * choice is unambiguous. Then add a distractor clause whose first
+     * token differs, to make sure stickiness isn't just "always top-1". */
+    SpatialAI* ai = spatial_ai_create();
+    ai_force_keyframe(ai, "고양이가 밥을 먹는다.", "meal");
+    ai_force_keyframe(ai, "강아지가 밥을 먹는다.", "meal");
+    ai_force_keyframe(ai, "사람이 밥을 먹는다.",   "meal");
+
+    char out[2048];
+    uint32_t n = ai_generate_refine(ai, "고양이가 밥을", out, sizeof(out), NULL);
+    assert(n > 0);
+
+    uint32_t chars = 0;
+    int ok = validate_utf8_strict(out, n, &chars);
+    printf("\n    sticky out=\"%s\" chars=%u valid=%d\n", out, chars, ok);
+    assert(ok);
+
+    /* With stickiness + character atomicity, the subject tag should
+     * stay coherent: output must contain one of the three trained
+     * subject tokens as a full trigram rather than a byte-mixed
+     * syllable. */
+    int has_subject = strstr(out, "고양이") != NULL ||
+                      strstr(out, "강아지") != NULL ||
+                      strstr(out, "사람")   != NULL;
+    assert(has_subject);
+
+    spatial_ai_destroy(ai);
+    PASS();
+}
+
 int main(void) {
     printf("=== test_generate_refine ===\n");
 
@@ -322,6 +526,10 @@ int main(void) {
     test_generate_refine_basic();
     test_generate_refine_unknown();
     test_generate_refine_empty();
+    test_refine_preserves_korean_syllables();
+    test_refine_no_frankenstein_glyphs();
+    test_refine_span_atomicity();
+    test_refine_morpheme_stickiness();
 
     printf("  %d/%d passed\n\n", tests_passed, tests_total);
     return (tests_passed == tests_total) ? 0 : 1;

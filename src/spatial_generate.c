@@ -508,51 +508,142 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
     return grid_decode_text_utf8(&ai->keyframes[target_id].grid, out, max_out);
 }
 
-/* UTF-8 role classification used by ai_generate_refine to gate
- * per-row swaps so refinement never mixes bytes from different
- * character classes (which would corrupt multi-byte sequences).
- * Every byte belongs to exactly one role:
- *   0 = ASCII (0xxxxxxx)
- *   1 = continuation (10xxxxxx)
- *   2 = 2-byte lead (110xxxxx)
- *   3 = 3-byte lead (1110xxxx)
- *   4 = 4-byte lead (11110xxx)
- *   5 = invalid (11111xxx) — never emitted, rejected during swap */
-static int utf8_role(uint8_t b) {
-    if ((b & 0x80) == 0x00) return 0;
-    if ((b & 0xC0) == 0x80) return 1;
-    if ((b & 0xE0) == 0xC0) return 2;
-    if ((b & 0xF0) == 0xE0) return 3;
-    if ((b & 0xF8) == 0xF0) return 4;
-    return 5;
+/* ── Character-level refinement helpers ──────────────────
+ *
+ * These three helpers exist so ai_generate_refine can swap entire
+ * UTF-8 character spans atomically instead of mixing bytes across
+ * sources on a row-by-row basis (which produced "사잌이"-style
+ * Frankenstein glyphs on the 18-clause seed corpus).
+ */
+
+/* Fill out_bytes[k][y] = argmax_x A[y,x] for each source k's grid.
+ * These bytes form each source's "canonical" output byte stream; the
+ * refine loop walks them in UTF-8 character spans. Sources whose grid
+ * has no activity at row y leave out_bytes[k][y] = 0 (which
+ * utf8_lead_len maps to role 0 / ASCII-NUL and is rejected by the
+ * span validator). */
+static void refine_collect_source_bytes(
+        const SpatialAI* ai,
+        const uint32_t* ids_next, uint32_t kcount,
+        uint8_t out_bytes[TOP_K][GRID_SIZE]) {
+    for (uint32_t k = 0; k < kcount && k < TOP_K; k++) {
+        uint32_t sid = ids_next[k];
+        if (sid >= ai->kf_count) {
+            memset(out_bytes[k], 0, GRID_SIZE);
+            continue;
+        }
+        const SpatialGrid* g = &ai->keyframes[sid].grid;
+        for (uint32_t y = 0; y < GRID_SIZE; y++) {
+            uint32_t best_x = 0;
+            uint16_t best_a = 0;
+            for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                uint16_t a = g->A[y * GRID_SIZE + x];
+                if (a > best_a) { best_a = a; best_x = x; }
+            }
+            out_bytes[k][y] = (uint8_t)best_x;
+        }
+    }
 }
 
-/* ── ai_generate_refine — top-k + refinement loop ──────────
+/* Validate `span_bytes[0..len-1]` as a UTF-8 sequence of length `len`
+ * and, if valid, return the summed agg_score_byte_full over the span.
+ * Returns -1.0 on mismatch (lead byte's UTF-8 width != len, or a
+ * continuation byte is missing) so the caller can skip this source. */
+static double refine_span_score(
+        const AggTables* tbl, const InputSignature* sig,
+        const SpatialGrid* cand,
+        const uint8_t* span_bytes, uint32_t y, int len) {
+    if (len <= 0) return -1.0;
+    if (utf8_lead_len(span_bytes[0]) != len) return -1.0;
+    for (int i = 1; i < len; i++) {
+        if (!utf8_is_cont(span_bytes[i])) return -1.0;
+    }
+
+    double sum = 0.0;
+    for (int i = 0; i < len; i++) {
+        double in_R, in_G, in_B;
+        input_signature_get(sig, y + (uint32_t)i, &in_R, &in_G, &in_B);
+        double s = agg_score_byte_full(tbl, y + (uint32_t)i,
+                                       span_bytes[i],
+                                       in_R, in_G, in_B, cand);
+        sum += s;
+    }
+    return sum;
+}
+
+/* Atomically replace rows [y, y+len) in `cand` with `new_x[0..len-1]`.
+ * Clears every cell in the old span first so shorter replacements
+ * never leave stray continuation bytes behind, then writes the new
+ * cells with aggregated R/G/B and A clamped to the span's scores.
+ * Updates cur_x[y..y+len-1] in place. */
+static void refine_commit_span(
+        SpatialGrid* cand, const AggTables* tbl,
+        uint32_t y, int len,
+        const uint8_t* new_x,
+        const double* per_row_scores,
+        uint32_t* cur_x) {
+    /* Phase 1: clear the old span. */
+    for (int i = 0; i < len; i++) {
+        uint32_t old_x = cur_x[y + (uint32_t)i];
+        if (old_x == UINT32_MAX) continue;
+        uint32_t old = (y + (uint32_t)i) * GRID_SIZE + old_x;
+        cand->A[old] = 0;
+        cand->R[old] = 0;
+        cand->G[old] = 0;
+        cand->B[old] = 0;
+    }
+    /* Phase 2: write the new span. */
+    for (int i = 0; i < len; i++) {
+        uint32_t idx = (y + (uint32_t)i) * GRID_SIZE + (uint32_t)new_x[i];
+        double s = per_row_scores ? per_row_scores[i] : 1.0;
+        if (s > 65535.0) s = 65535.0;
+        if (s < 1.0)     s = 1.0;
+        cand->A[idx] = (uint16_t)s;
+        cand->R[idx] = (uint8_t)tbl->R_mean[idx];
+        cand->G[idx] = (uint8_t)tbl->G_mean[idx];
+        cand->B[idx] = (uint8_t)tbl->B_mean[idx];
+        cur_x[y + (uint32_t)i] = new_x[i];
+    }
+}
+
+/* Cheap word-boundary predicate: returns 1 when the byte range
+ * text[a..b-1] contains NO ASCII whitespace or punctuation, so the
+ * two offsets lie in the same word. Works at the byte level because
+ * UTF-8 continuation bytes (0x80..0xBF) are never whitespace nor
+ * ASCII punctuation. */
+static int refine_same_word(const char* text, uint32_t a, uint32_t b) {
+    if (!text || b <= a) return 0;
+    for (uint32_t i = a; i < b; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return 0;
+        if (c == '.' || c == ',' || c == '!' || c == '?') return 0;
+        if (c == ':' || c == ';' || c == '(' || c == ')') return 0;
+        if (c == '"' || c == '\'') return 0;
+    }
+    return 1;
+}
+
+/* ── ai_generate_refine — character-level + stickiness ────
  *
- * Revised pipeline (spec §3.1 / §3.4 with a UTF-8 anchoring fix):
+ * Revised pipeline (spec §3.1 / §3.4 plus the character-span fix):
  *
- *   1. encode input_text through the full layer pipeline
- *   2. spatial_match(MATCH_PREDICT) → top-k ids + scores.
- *      MATCH_PREDICT's RGB-weighted cosine discriminates far better
- *      than MATCH_GENERATE's bg_score on small corpora, where B×G
- *      alone saturates across too many keyframes.
+ *   1. encode input through the full layer pipeline
+ *   2. spatial_match(MATCH_PREDICT) → top-k ids + scores (RGB-weighted
+ *      cosine — discriminative even on tiny corpora where MATCH_GENERATE
+ *      saturates)
  *   3. build focused AggTables from the top-k's NEXT-in-topic frames
- *      (so the prior describes "what should follow", not the match
- *      itself).
- *   4. seed the candidate from the TOP-1 next-in-topic grid. This
- *      guarantees a UTF-8-valid starting sentence; row-independent
- *      argmax would otherwise mix bytes across multi-byte characters
- *      and emit undecodable sequences.
- *   5. refinement loop: for each row y, search for an x whose
- *      agg_score_byte_full beats the seed's x AND whose UTF-8 role
- *      matches the seed byte's role (ASCII↔ASCII, 3-byte-lead↔3-byte-
- *      lead, continuation↔continuation, …). This lets top-k
- *      substitutions ("고양이 → 강아지") propagate without breaking
- *      character boundaries.
+ *   4. seed candidate from the top-1 next-in-topic grid (UTF-8 safe)
+ *   5. character-span refinement: walk the seed in UTF-8 characters
+ *      (1/2/3/4 rows) and for each span pick the winning source among
+ *      {seed, top-k next frames}. A source is only considered when its
+ *      bytes at this offset form a UTF-8 sequence of exactly the same
+ *      length as the seed. Morpheme-word stickiness: the previous
+ *      character's source KF earns a small bonus when the two chars
+ *      lie inside the same word (no whitespace/punct between them).
  *   6. decode via grid_decode_text_utf8.
  *
- * Convergence: stop when rows changed drops below GEN_REFINE_CONVERGE
- * or after GEN_REFINE_ITERS iterations.
+ * Convergence: stop when characters-swapped drops below
+ * GEN_REFINE_CONVERGE or after GEN_REFINE_ITERS iterations.
  */
 uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
                             char* out, uint32_t max_out,
@@ -640,66 +731,119 @@ uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
         cur_x[y] = best_x;
     }
 
-    /* 5. Refinement loop — UTF-8-role-gated swaps. */
+    /* 5. Pre-compute source byte streams (top-k next-in-topic) + seed
+     *    decoded text for word-boundary checks. */
+    uint32_t ids_next[TOP_K];
+    for (uint32_t k = 0; k < kcount; k++) {
+        ids_next[k] = ai_next_in_topic(ai, ids[k]);
+    }
+
+    uint8_t src_bytes[TOP_K][GRID_SIZE];
+    memset(src_bytes, 0, sizeof(src_bytes));
+    refine_collect_source_bytes(ai, ids_next, kcount, src_bytes);
+
+    /* Build a byte_offset[y] → decoded_text_offset map for the seed.
+     * grid_decode_text_utf8 reads one row per byte emitted, so the
+     * cumulative byte count after decoding up to row y tells us where
+     * in seed_text the character at row y begins. */
+    char     seed_text[2048];
+    uint32_t row_off[GRID_SIZE];        /* row y → byte offset in seed_text */
+    for (uint32_t y = 0; y < GRID_SIZE; y++) row_off[y] = UINT32_MAX;
+    {
+        uint32_t total = grid_decode_text_utf8(cand, seed_text, sizeof(seed_text));
+        /* Re-walk cand by character to populate row_off. */
+        uint32_t y = 0, off = 0;
+        while (y < GRID_SIZE && off < total) {
+            if (cur_x[y] == UINT32_MAX) { y++; continue; }
+            int len = utf8_lead_len((uint8_t)cur_x[y]);
+            if (len <= 0) { y++; continue; }
+            row_off[y] = off;
+            off += (uint32_t)len;
+            y   += (uint32_t)len;
+        }
+    }
+
     InputSignature sig;
     input_signature_compute(&sig, in_grid);
 
+    /* 6. Character-span refinement loop. */
     int prev_changed = (int)GRID_SIZE + 1;
     for (int iter = 0; iter < GEN_REFINE_ITERS; iter++) {
-        int changed = 0;
-        for (uint32_t y = 0; y < GRID_SIZE; y++) {
-            if (tbl->row_total_A[y] <= 0.0) continue;
-            if (cur_x[y] == UINT32_MAX) continue;
+        int     changed     = 0;
+        int     prev_k      = -1;
+        uint32_t prev_end   = UINT32_MAX;
 
-            double in_R, in_G, in_B;
-            input_signature_get(&sig, y, &in_R, &in_G, &in_B);
+        uint32_t y = 0;
+        while (y < GRID_SIZE) {
+            if (cur_x[y] == UINT32_MAX) { y++; continue; }
+            uint8_t lead = (uint8_t)cur_x[y];
+            int len = utf8_lead_len(lead);
+            if (len <= 0) len = 1;
+            if (y + (uint32_t)len > GRID_SIZE) break;
 
-            /* Current (seed) score and its UTF-8 role. */
-            int seed_role = utf8_role((uint8_t)cur_x[y]);
-            double cur_score = agg_score_byte_full(
-                tbl, y, (uint8_t)cur_x[y], in_R, in_G, in_B, cand);
+            /* Seed span as the baseline candidate. */
+            uint8_t seed_span[4] = {0,0,0,0};
+            for (int i = 0; i < len; i++) seed_span[i] = (uint8_t)cur_x[y + (uint32_t)i];
 
-            /* Search for a strictly better-scoring alternate x whose
-             * role matches seed_role. Role gating is what keeps the
-             * multi-byte sequence intact: ASCII stays ASCII, 3-byte
-             * leads stay 3-byte leads, continuations stay
-             * continuations. */
-            double best_score = cur_score;
-            uint32_t best_x   = cur_x[y];
-            for (uint32_t x = 0; x < GRID_SIZE; x++) {
-                if ((uint32_t)x == cur_x[y]) continue;
-                if (utf8_role((uint8_t)x) != seed_role) continue;
-                double s = agg_score_byte_full(tbl, y, (uint8_t)x,
-                                               in_R, in_G, in_B, cand);
-                if (s > best_score) { best_score = s; best_x = x; }
+            double seed_score = refine_span_score(tbl, &sig, cand, seed_span, y, len);
+            double best_score = seed_score;
+            uint8_t best_span[4];
+            memcpy(best_span, seed_span, (size_t)len);
+            int best_k = -1;   /* -1 = keep seed */
+
+            /* Evaluate each top-k source's span at this offset. */
+            for (uint32_t k = 0; k < kcount; k++) {
+                uint8_t span[4] = {0,0,0,0};
+                for (int i = 0; i < len; i++) span[i] = src_bytes[k][y + (uint32_t)i];
+                double s = refine_span_score(tbl, &sig, cand, span, y, len);
+                if (s < 0.0) continue;
+
+                /* Morpheme stickiness: reward sticking with the
+                 * previous character's source when we haven't crossed
+                 * a word boundary. Proportional to row activity so
+                 * it scales with the AggTable's confidence. */
+                if (prev_k >= 0 && (int)k == prev_k &&
+                    prev_end != UINT32_MAX && row_off[y] != UINT32_MAX &&
+                    refine_same_word(seed_text, prev_end, row_off[y])) {
+                    s += GEN_STICKY_BONUS_FRAC * (double)len * tbl->row_total_A[y];
+                }
+
+                if (s > best_score) {
+                    best_score = s;
+                    memcpy(best_span, span, (size_t)len);
+                    best_k = (int)k;
+                }
             }
-            if (best_x == cur_x[y]) continue;
 
-            /* Commit swap: clear old cell, write new one with the
-             * AggTable's mean colors so downstream spatial scoring
-             * sees consistent R/G/B. */
-            uint32_t old = y * GRID_SIZE + cur_x[y];
-            cand->A[old] = 0;
-            cand->R[old] = 0;
-            cand->G[old] = 0;
-            cand->B[old] = 0;
+            /* Commit span if it differs from the seed. */
+            int differs = 0;
+            for (int i = 0; i < len; i++) {
+                if (best_span[i] != seed_span[i]) { differs = 1; break; }
+            }
+            if (differs) {
+                /* Per-row score distribution: equal share across span. */
+                double per_row[4];
+                double share = best_score / (double)len;
+                if (share < 1.0) share = 1.0;
+                for (int i = 0; i < len; i++) per_row[i] = share;
+                refine_commit_span(cand, tbl, y, len, best_span, per_row, cur_x);
+                changed++;
+            }
 
-            uint32_t idx = y * GRID_SIZE + best_x;
-            double clipA = best_score > 65535.0 ? 65535.0 : best_score;
-            if (clipA < 1.0) clipA = 1.0;  /* must remain active for decode */
-            cand->A[idx] = (uint16_t)clipA;
-            cand->R[idx] = (uint8_t)tbl->R_mean[idx];
-            cand->G[idx] = (uint8_t)tbl->G_mean[idx];
-            cand->B[idx] = (uint8_t)tbl->B_mean[idx];
-            cur_x[y] = best_x;
-            changed++;
+            /* Update stickiness state. */
+            prev_k  = best_k;
+            prev_end = (row_off[y] != UINT32_MAX)
+                       ? row_off[y] + (uint32_t)len
+                       : UINT32_MAX;
+            y += (uint32_t)len;
         }
+
         if (changed < GEN_REFINE_CONVERGE) break;
         if (changed >= prev_changed) break;
         prev_changed = changed;
     }
 
-    /* 6. Decode. */
+    /* 7. Decode. */
     uint32_t written = grid_decode_text_utf8(cand, out, max_out);
 
     grid_destroy(cand);

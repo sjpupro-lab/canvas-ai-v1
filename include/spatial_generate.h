@@ -129,6 +129,13 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
 #define GEN_REFINE_ITERS      4
 #define GEN_REFINE_CONVERGE   2
 
+/* Morpheme-boundary stickiness bonus for character-level refinement.
+ * When two adjacent characters lie inside the same word, the previous
+ * character's source KF earns a bonus proportional to the row's total
+ * aggregated mass (≈5% of a typical span score). Keeps same-word
+ * output coherent without dominating a clearly better source. */
+#define GEN_STICKY_BONUS_FRAC 0.05
+
 /* Build aggregated tables from only the specified keyframe ids,
  * weighted by the matching scores (0..1). When scores == NULL, every
  * id is weighted equally at 1.0.
