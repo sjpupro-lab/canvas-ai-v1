@@ -704,7 +704,20 @@ uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
         return 0;
     }
 
-    /* 4. Seed candidate with the top-1 next-in-topic grid (UTF-8 safe). */
+    /* 4. Seed candidate with the top-1 next-in-topic grid.
+     *
+     * PR #2's original text described "row-argmax under RGBA scoring" as
+     * the seed — that was the pre-107fd28 behaviour. It produced byte-
+     * mixed UTF-8 (rows y and y+1 of one character picked bytes from
+     * different top-k sources → invalid continuation bytes → decode
+     * failure). Commit 107fd28 switched to "copy the top-1 next-in-
+     * topic grid" so the seed is guaranteed UTF-8-valid. The character-
+     * span refinement loop below then aggregates top-k sources *at
+     * character granularity* instead of per-row, which is what the
+     * original spec was reaching for but couldn't achieve via per-row
+     * argmax. Net effect: substitutions still blend across top-k (via
+     * refinement), but every intermediate and final state is decodable
+     * UTF-8. */
     uint32_t seed_id = ai_next_in_topic(ai, ids[0]);
     if (seed_id >= ai->kf_count) seed_id = ids[0];
 
@@ -717,9 +730,7 @@ uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
     }
     grid_copy(cand, &ai->keyframes[seed_id].grid);
 
-    /* Track current column per row so we can revert on swap. Derived
-     * from seed via row-argmax (seed has exactly one active cell per
-     * row in the common case; argmax handles accidental ties). */
+    /* Track current column per row for the refinement loop. */
     uint32_t cur_x[GRID_SIZE];
     for (uint32_t y = 0; y < GRID_SIZE; y++) {
         uint32_t best_x = UINT32_MAX;
