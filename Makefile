@@ -135,6 +135,13 @@ $(BUILD_DIR)/verify_refine: tools/verify_refine.c $(OBJS) | $(BUILD_DIR)
 verify_refine: $(BUILD_DIR)/verify_refine
 	./$(BUILD_DIR)/verify_refine
 
+# ─── PR #2 end-to-end verifier (base_patterns + wiki5k + sample_en) ──
+$(BUILD_DIR)/verify_pr2: tools/verify_pr2.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+verify_pr2: $(BUILD_DIR)/verify_pr2
+	./$(BUILD_DIR)/verify_pr2
+
 chat: $(BUILD_DIR)/chat
 	@echo "Built chat. Example:"
 	@echo "  ./build/chat --load build/models/wiki5k.spai"
