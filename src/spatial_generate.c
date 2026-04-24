@@ -508,22 +508,51 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
     return grid_decode_text_utf8(&ai->keyframes[target_id].grid, out, max_out);
 }
 
+/* UTF-8 role classification used by ai_generate_refine to gate
+ * per-row swaps so refinement never mixes bytes from different
+ * character classes (which would corrupt multi-byte sequences).
+ * Every byte belongs to exactly one role:
+ *   0 = ASCII (0xxxxxxx)
+ *   1 = continuation (10xxxxxx)
+ *   2 = 2-byte lead (110xxxxx)
+ *   3 = 3-byte lead (1110xxxx)
+ *   4 = 4-byte lead (11110xxx)
+ *   5 = invalid (11111xxx) — never emitted, rejected during swap */
+static int utf8_role(uint8_t b) {
+    if ((b & 0x80) == 0x00) return 0;
+    if ((b & 0xC0) == 0x80) return 1;
+    if ((b & 0xE0) == 0xC0) return 2;
+    if ((b & 0xF0) == 0xE0) return 3;
+    if ((b & 0xF8) == 0xF0) return 4;
+    return 5;
+}
+
 /* ── ai_generate_refine — top-k + refinement loop ──────────
  *
- * Spec §3.1/§3.4 pipeline.
+ * Revised pipeline (spec §3.1 / §3.4 with a UTF-8 anchoring fix):
  *
- *   1. encode input
- *   2. spatial_match(MATCH_GENERATE) → top-k ids + scores
- *   3. build a focused AggTables from the top-k's NEXT-in-topic frames
- *   4. initial candidate grid: for each row, the argmax x under
- *      agg_score_byte (RGBA only; no spatial yet so we have a seed)
- *   5. refinement loop: rescore every row using agg_score_byte_full,
- *      which also reads the current candidate's neighborhood →
- *      row-local argmax replaces the previous pick when different.
- *   6. decode candidate via grid_decode_text_utf8.
+ *   1. encode input_text through the full layer pipeline
+ *   2. spatial_match(MATCH_PREDICT) → top-k ids + scores.
+ *      MATCH_PREDICT's RGB-weighted cosine discriminates far better
+ *      than MATCH_GENERATE's bg_score on small corpora, where B×G
+ *      alone saturates across too many keyframes.
+ *   3. build focused AggTables from the top-k's NEXT-in-topic frames
+ *      (so the prior describes "what should follow", not the match
+ *      itself).
+ *   4. seed the candidate from the TOP-1 next-in-topic grid. This
+ *      guarantees a UTF-8-valid starting sentence; row-independent
+ *      argmax would otherwise mix bytes across multi-byte characters
+ *      and emit undecodable sequences.
+ *   5. refinement loop: for each row y, search for an x whose
+ *      agg_score_byte_full beats the seed's x AND whose UTF-8 role
+ *      matches the seed byte's role (ASCII↔ASCII, 3-byte-lead↔3-byte-
+ *      lead, continuation↔continuation, …). This lets top-k
+ *      substitutions ("고양이 → 강아지") propagate without breaking
+ *      character boundaries.
+ *   6. decode via grid_decode_text_utf8.
  *
- * Convergence: stop when the number of row changes drops below
- * GEN_REFINE_CONVERGE or after GEN_REFINE_ITERS iterations.
+ * Convergence: stop when rows changed drops below GEN_REFINE_CONVERGE
+ * or after GEN_REFINE_ITERS iterations.
  */
 uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
                             char* out, uint32_t max_out,
@@ -545,11 +574,20 @@ uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
     update_rgb_directional(in_grid);
     apply_ema_to_grid(ai, in_grid);
 
-    /* 2. Top-k retrieval (MATCH_GENERATE — B×G precision stage). */
+    /* Zero-input short-circuit: empty or whitespace-only input produces
+     * no grid activity, so retrieval is meaningless. Return empty. */
+    if (grid_active_count(in_grid) == 0) {
+        grid_destroy(in_grid);
+        out[0] = '\0';
+        if (out_match_similarity) *out_match_similarity = 0.0f;
+        return 0;
+    }
+
+    /* 2. Top-k retrieval (MATCH_PREDICT — RGB-weighted cosine). */
     MatchContext ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.bucket_idx = &ai->bucket_idx;
-    MatchResult r = spatial_match(ai, in_grid, MATCH_GENERATE, &ctx);
+    MatchResult r = spatial_match(ai, in_grid, MATCH_PREDICT, &ctx);
 
     if (r.topk_count == 0 || r.best_id >= ai->kf_count) {
         grid_destroy(in_grid);
@@ -567,9 +605,7 @@ uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
         sc [i] = r.topk[i].score;
     }
 
-    /* 3. Focused AggTables from top-k next-in-topic frames. When no
-     *    topic information is present, next-in-topic degrades to id+1
-     *    which still captures the "temporal successor" of each match. */
+    /* 3. Focused AggTables from top-k next-in-topic frames. */
     AggTables* tbl = agg_build_topk(ai, ids, sc, kcount, /*use_next_in_topic*/ 1);
     if (!tbl) {
         grid_destroy(in_grid);
@@ -577,9 +613,9 @@ uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
         return 0;
     }
 
-    /* 4. Initial candidate: row-argmax under agg_score_byte (RGBA only). */
-    InputSignature sig;
-    input_signature_compute(&sig, in_grid);
+    /* 4. Seed candidate with the top-1 next-in-topic grid (UTF-8 safe). */
+    uint32_t seed_id = ai_next_in_topic(ai, ids[0]);
+    if (seed_id >= ai->kf_count) seed_id = ids[0];
 
     SpatialGrid* cand = grid_create();
     if (!cand) {
@@ -588,71 +624,78 @@ uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
         out[0] = '\0';
         return 0;
     }
+    grid_copy(cand, &ai->keyframes[seed_id].grid);
 
+    /* Track current column per row so we can revert on swap. Derived
+     * from seed via row-argmax (seed has exactly one active cell per
+     * row in the common case; argmax handles accidental ties). */
     uint32_t cur_x[GRID_SIZE];
-    for (uint32_t i = 0; i < GRID_SIZE; i++) cur_x[i] = UINT32_MAX;
-
     for (uint32_t y = 0; y < GRID_SIZE; y++) {
-        if (tbl->row_total_A[y] <= 0.0) continue;
-        double in_R, in_G, in_B;
-        input_signature_get(&sig, y, &in_R, &in_G, &in_B);
-
-        double best_score = 0.0;
-        uint32_t best_x = 0;
+        uint32_t best_x = UINT32_MAX;
+        uint16_t best_a = 0;
         for (uint32_t x = 0; x < GRID_SIZE; x++) {
-            double s = agg_score_byte(tbl, y, (uint8_t)x, in_R, in_G, in_B);
-            if (s > best_score) { best_score = s; best_x = x; }
+            uint32_t i = y * GRID_SIZE + x;
+            if (cand->A[i] > best_a) { best_a = cand->A[i]; best_x = x; }
         }
-        if (best_score <= 0.0) continue;
-
-        uint32_t idx = y * GRID_SIZE + best_x;
-        double clipA = best_score > 65535.0 ? 65535.0 : best_score;
-        cand->A[idx] = (uint16_t)clipA;
-        cand->R[idx] = (uint8_t)tbl->R_mean[idx];
-        cand->G[idx] = (uint8_t)tbl->G_mean[idx];
-        cand->B[idx] = (uint8_t)tbl->B_mean[idx];
         cur_x[y] = best_x;
     }
 
-    /* 5. Refinement loop — spatial-aware rescoring. */
+    /* 5. Refinement loop — UTF-8-role-gated swaps. */
+    InputSignature sig;
+    input_signature_compute(&sig, in_grid);
+
     int prev_changed = (int)GRID_SIZE + 1;
     for (int iter = 0; iter < GEN_REFINE_ITERS; iter++) {
         int changed = 0;
         for (uint32_t y = 0; y < GRID_SIZE; y++) {
             if (tbl->row_total_A[y] <= 0.0) continue;
+            if (cur_x[y] == UINT32_MAX) continue;
+
             double in_R, in_G, in_B;
             input_signature_get(&sig, y, &in_R, &in_G, &in_B);
 
-            double best_score = 0.0;
-            uint32_t best_x = 0;
+            /* Current (seed) score and its UTF-8 role. */
+            int seed_role = utf8_role((uint8_t)cur_x[y]);
+            double cur_score = agg_score_byte_full(
+                tbl, y, (uint8_t)cur_x[y], in_R, in_G, in_B, cand);
+
+            /* Search for a strictly better-scoring alternate x whose
+             * role matches seed_role. Role gating is what keeps the
+             * multi-byte sequence intact: ASCII stays ASCII, 3-byte
+             * leads stay 3-byte leads, continuations stay
+             * continuations. */
+            double best_score = cur_score;
+            uint32_t best_x   = cur_x[y];
             for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                if ((uint32_t)x == cur_x[y]) continue;
+                if (utf8_role((uint8_t)x) != seed_role) continue;
                 double s = agg_score_byte_full(tbl, y, (uint8_t)x,
                                                in_R, in_G, in_B, cand);
                 if (s > best_score) { best_score = s; best_x = x; }
             }
-            if (best_score <= 0.0) continue;
+            if (best_x == cur_x[y]) continue;
 
-            if (cur_x[y] != best_x) {
-                /* Clear previous pick in this row */
-                if (cur_x[y] != UINT32_MAX) {
-                    uint32_t old = y * GRID_SIZE + cur_x[y];
-                    cand->A[old] = 0;
-                    cand->R[old] = 0;
-                    cand->G[old] = 0;
-                    cand->B[old] = 0;
-                }
-                uint32_t idx = y * GRID_SIZE + best_x;
-                double clipA = best_score > 65535.0 ? 65535.0 : best_score;
-                cand->A[idx] = (uint16_t)clipA;
-                cand->R[idx] = (uint8_t)tbl->R_mean[idx];
-                cand->G[idx] = (uint8_t)tbl->G_mean[idx];
-                cand->B[idx] = (uint8_t)tbl->B_mean[idx];
-                cur_x[y] = best_x;
-                changed++;
-            }
+            /* Commit swap: clear old cell, write new one with the
+             * AggTable's mean colors so downstream spatial scoring
+             * sees consistent R/G/B. */
+            uint32_t old = y * GRID_SIZE + cur_x[y];
+            cand->A[old] = 0;
+            cand->R[old] = 0;
+            cand->G[old] = 0;
+            cand->B[old] = 0;
+
+            uint32_t idx = y * GRID_SIZE + best_x;
+            double clipA = best_score > 65535.0 ? 65535.0 : best_score;
+            if (clipA < 1.0) clipA = 1.0;  /* must remain active for decode */
+            cand->A[idx] = (uint16_t)clipA;
+            cand->R[idx] = (uint8_t)tbl->R_mean[idx];
+            cand->G[idx] = (uint8_t)tbl->G_mean[idx];
+            cand->B[idx] = (uint8_t)tbl->B_mean[idx];
+            cur_x[y] = best_x;
+            changed++;
         }
         if (changed < GEN_REFINE_CONVERGE) break;
-        if (changed >= prev_changed) break;  /* stopped improving */
+        if (changed >= prev_changed) break;
         prev_changed = changed;
     }
 

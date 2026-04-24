@@ -128,6 +128,13 @@ $(BUILD_DIR)/stream_train: tools/stream_train.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/chat: tools/chat.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
+# ─── Refinement generation verifier ──────────────────────────────
+$(BUILD_DIR)/verify_refine: tools/verify_refine.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+verify_refine: $(BUILD_DIR)/verify_refine
+	./$(BUILD_DIR)/verify_refine
+
 chat: $(BUILD_DIR)/chat
 	@echo "Built chat. Example:"
 	@echo "  ./build/chat --load build/models/wiki5k.spai"
