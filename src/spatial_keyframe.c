@@ -546,6 +546,29 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     return new_id;
 }
 
+uint32_t ai_next_in_topic(const SpatialAI* ai, uint32_t matched_id) {
+    if (!ai || ai->kf_count == 0 || matched_id >= ai->kf_count) return matched_id;
+    uint32_t topic = ai->keyframes[matched_id].topic_hash;
+    uint32_t seq   = ai->keyframes[matched_id].seq_in_topic;
+
+    if (topic == 0) {
+        return (matched_id + 1 < ai->kf_count) ? matched_id + 1 : matched_id;
+    }
+
+    uint32_t best_next = UINT32_MAX;
+    uint32_t best_diff = UINT32_MAX;
+    for (uint32_t i = 0; i < ai->kf_count; i++) {
+        if (ai->keyframes[i].topic_hash != topic) continue;
+        if (ai->keyframes[i].seq_in_topic <= seq) continue;
+        uint32_t diff = ai->keyframes[i].seq_in_topic - seq;
+        if (diff < best_diff) { best_diff = diff; best_next = i; }
+    }
+    if (best_next == UINT32_MAX) {
+        return (matched_id + 1 < ai->kf_count) ? matched_id + 1 : matched_id;
+    }
+    return best_next;
+}
+
 uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity) {
     if (!ai || !input_text || ai->kf_count == 0) {
         if (out_similarity) *out_similarity = 0.0f;

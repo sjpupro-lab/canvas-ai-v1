@@ -381,6 +381,26 @@ uint32_t canvas_delta_sparse(const SpatialCanvas* a, const SpatialCanvas* b,
     return n;
 }
 
+uint32_t canvas_delta_sparse_rgb(const SpatialCanvas* a, const SpatialCanvas* b,
+                                 CanvasDeltaEntryRGB* out, uint32_t max_out) {
+    if (!a || !b || !out) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < CV_TOTAL && n < max_out; i++) {
+        int16_t dA = (int16_t)b->A[i] - (int16_t)a->A[i];
+        int    dR = (int)b->R[i] - (int)a->R[i];
+        int    dG = (int)b->G[i] - (int)a->G[i];
+        int    dB = (int)b->B[i] - (int)a->B[i];
+        if (dA == 0 && dR == 0 && dG == 0 && dB == 0) continue;
+        out[n].index  = i;
+        out[n].diff_A = dA;
+        out[n].diff_R = (int8_t)(dR < -128 ? -128 : dR > 127 ? 127 : dR);
+        out[n].diff_G = (int8_t)(dG < -128 ? -128 : dG > 127 ? 127 : dG);
+        out[n].diff_B = (int8_t)(dB < -128 ? -128 : dB > 127 ? 127 : dB);
+        n++;
+    }
+    return n;
+}
+
 uint32_t canvas_delta_rle_bytes(const CanvasDeltaEntry* entries, uint32_t count) {
     if (!entries || count == 0) return 0;
     /* RLE record: (start:u32, length:u16, diff:i16) = 8 bytes per run.

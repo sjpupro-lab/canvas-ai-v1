@@ -332,39 +332,139 @@ uint32_t grid_decode_text_utf8(const SpatialGrid* g, char* out, uint32_t max_out
     return written;
 }
 
+/* ── Top-K weighted AggTables ─────────────────────────────
+ *
+ * agg_build / agg_build_from_pool aggregate over *every* keyframe or
+ * canvas slot — a global prior. For refinement generation we want a
+ * focused prior: only the top-k most similar frames, optionally their
+ * next-in-topic successors, each weighted by its match score so the
+ * strongest match dominates the aggregated R/G/B.
+ */
+AggTables* agg_build_topk(const SpatialAI* ai,
+                          const uint32_t* ids, const float* scores,
+                          uint32_t count, int use_next_in_topic) {
+    if (!ai || !ids || count == 0) return NULL;
+    AggTables* t = (AggTables*)calloc(1, sizeof(AggTables));
+    if (!t) return NULL;
+
+    for (uint32_t c = 0; c < count; c++) {
+        uint32_t src = ids[c];
+        if (use_next_in_topic) src = ai_next_in_topic(ai, src);
+        if (src >= ai->kf_count) continue;
+
+        /* Floor keeps every top-k contributor alive even when the raw
+         * match score came back at 0 (e.g. no B-channel activity on a
+         * new corpus). Without the floor the strongest match would
+         * monopolise the aggregation and we'd collapse back to top-1. */
+        double w = scores ? (double)scores[c] : 1.0;
+        if (!(w > 0.05)) w = 0.05;
+
+        const SpatialGrid* g = &ai->keyframes[src].grid;
+        for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+            uint16_t a = g->A[i];
+            if (a == 0) continue;
+            double da = (double)a * w;
+            t->A_sum [i] += da;
+            t->R_mean[i] += da * (double)g->R[i];
+            t->G_mean[i] += da * (double)g->G[i];
+            t->B_mean[i] += da * (double)g->B[i];
+        }
+    }
+
+    for (uint32_t y = 0; y < GRID_SIZE; y++) {
+        double row = 0.0;
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            uint32_t i = y * GRID_SIZE + x;
+            if (t->A_sum[i] > 0.0) {
+                t->R_mean[i] /= t->A_sum[i];
+                t->G_mean[i] /= t->A_sum[i];
+                t->B_mean[i] /= t->A_sum[i];
+            }
+            row += t->A_sum[i];
+        }
+        t->row_total_A[y] = row;
+    }
+    return t;
+}
+
+/* ── Spatial pattern similarity ────────────────────────── */
+
+double spatial_pattern_score(const AggTables* t, uint32_t y, uint8_t v,
+                             const SpatialGrid* input) {
+    if (!t) return 0.5;
+    uint32_t ci = y * GRID_SIZE + (uint32_t)v;
+    if (t->A_sum[ci] <= 0.0) return 0.0;
+
+    double cR = t->R_mean[ci];
+    double cG = t->G_mean[ci];
+    double cB = t->B_mean[ci];
+
+    /* 8-neighbor offsets: up/down/left/right + 4 diagonals */
+    static const int offs[8][2] = {
+        {-1,-1},{-1, 0},{-1, 1},
+        { 0,-1},        { 0, 1},
+        { 1,-1},{ 1, 0},{ 1, 1}
+    };
+
+    double coh_sum = 0.0;  int coh_n = 0;
+    double inp_sum = 0.0;  int inp_n = 0;
+
+    for (int k = 0; k < 8; k++) {
+        int ny = (int)y + offs[k][0];
+        int nv = (int)v + offs[k][1];
+        if (ny < 0 || ny >= (int)GRID_SIZE ||
+            nv < 0 || nv >= (int)GRID_SIZE) continue;
+        uint32_t ni = (uint32_t)(ny * (int)GRID_SIZE + nv);
+
+        /* Cluster coherence: AggTable neighbor's color vs center color */
+        if (t->A_sum[ni] > 0.0) {
+            double nR = t->R_mean[ni];
+            double nG = t->G_mean[ni];
+            double nB = t->B_mean[ni];
+            double dR = fabs(nR - cR) / 255.0;
+            double dG = fabs(nG - cG) / 255.0;
+            double dB = fabs(nB - cB) / 255.0;
+            double sim = 1.0 - (dR + dG + dB) / 3.0;
+            if (sim < 0.0) sim = 0.0;
+            coh_sum += sim;
+            coh_n++;
+        }
+
+        /* Input agreement: input's neighbor color vs center color */
+        if (input && input->A[ni] > 0) {
+            double dR = fabs((double)input->R[ni] - cR) / 255.0;
+            double dG = fabs((double)input->G[ni] - cG) / 255.0;
+            double dB = fabs((double)input->B[ni] - cB) / 255.0;
+            double sim = 1.0 - (dR + dG + dB) / 3.0;
+            if (sim < 0.0) sim = 0.0;
+            inp_sum += sim;
+            inp_n++;
+        }
+    }
+
+    double coh = (coh_n > 0) ? (coh_sum / (double)coh_n) : 0.5;
+    double inp = (inp_n > 0) ? (inp_sum / (double)inp_n) : 0.5;
+    /* Equal weight: cluster prior + input grounding. */
+    return 0.5 * coh + 0.5 * inp;
+}
+
+double agg_score_byte_full(const AggTables* t, uint32_t y, uint8_t v,
+                           double in_R, double in_G, double in_B,
+                           const SpatialGrid* input) {
+    double base = agg_score_byte(t, y, v, in_R, in_G, in_B);
+    if (base <= 0.0) return 0.0;
+    double sp = spatial_pattern_score(t, y, v, input);
+    /* Smooth to [0.5, 1.0]: keeps the RGBA product as the dominant
+     * signal and treats spatial_pattern as a modulator rather than a
+     * veto. Matches spec §4.4 "spatial_weight × delta_weight". */
+    double modulator = 0.5 + 0.5 * sp;
+    return base * modulator;
+}
+
 /* ── Full-clause generation ────────────────────────────── */
 
-/* ── Topic-aware next-frame lookup ──
- *
- * For a matched keyframe carrying a non-zero topic_hash, the "next"
- * frame is the same-topic keyframe whose seq_in_topic is the
- * smallest value strictly greater than the matched KF's seq. When
- * the match has no topic_hash (label-less input) or there's nothing
- * ahead of it in the topic, fall back to id+1 — which preserves the
- * original generation behavior on legacy data. */
-static uint32_t find_next_in_topic(const SpatialAI* ai, uint32_t matched_id) {
-    if (matched_id >= ai->kf_count) return matched_id;
-    uint32_t topic = ai->keyframes[matched_id].topic_hash;
-    uint32_t seq   = ai->keyframes[matched_id].seq_in_topic;
-
-    if (topic == 0) {
-        /* no topic assigned: legacy sequential fallback */
-        return (matched_id + 1 < ai->kf_count) ? matched_id + 1 : matched_id;
-    }
-
-    uint32_t best_next = UINT32_MAX;
-    uint32_t best_diff = UINT32_MAX;
-    for (uint32_t i = 0; i < ai->kf_count; i++) {
-        if (ai->keyframes[i].topic_hash != topic) continue;
-        if (ai->keyframes[i].seq_in_topic <= seq) continue;
-        uint32_t diff = ai->keyframes[i].seq_in_topic - seq;
-        if (diff < best_diff) { best_diff = diff; best_next = i; }
-    }
-    if (best_next == UINT32_MAX) {
-        return (matched_id + 1 < ai->kf_count) ? matched_id + 1 : matched_id;
-    }
-    return best_next;
-}
+/* Topic-aware next-frame lookup lives in spatial_keyframe.c so it can
+ * be shared with refinement generation; we just use ai_next_in_topic. */
 
 uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
                           char* out, uint32_t max_out,
@@ -402,8 +502,165 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
 
     /* 3. Next frame: topic-aware if the matched KF has a topic tag,
      *    otherwise sequential (legacy). */
-    uint32_t target_id = find_next_in_topic(ai, r.best_id);
+    uint32_t target_id = ai_next_in_topic(ai, r.best_id);
 
     /* 4. Decode target frame's grid → text (UTF-8 aware). */
     return grid_decode_text_utf8(&ai->keyframes[target_id].grid, out, max_out);
+}
+
+/* ── ai_generate_refine — top-k + refinement loop ──────────
+ *
+ * Spec §3.1/§3.4 pipeline.
+ *
+ *   1. encode input
+ *   2. spatial_match(MATCH_GENERATE) → top-k ids + scores
+ *   3. build a focused AggTables from the top-k's NEXT-in-topic frames
+ *   4. initial candidate grid: for each row, the argmax x under
+ *      agg_score_byte (RGBA only; no spatial yet so we have a seed)
+ *   5. refinement loop: rescore every row using agg_score_byte_full,
+ *      which also reads the current candidate's neighborhood →
+ *      row-local argmax replaces the previous pick when different.
+ *   6. decode candidate via grid_decode_text_utf8.
+ *
+ * Convergence: stop when the number of row changes drops below
+ * GEN_REFINE_CONVERGE or after GEN_REFINE_ITERS iterations.
+ */
+uint32_t ai_generate_refine(SpatialAI* ai, const char* input_text,
+                            char* out, uint32_t max_out,
+                            float* out_match_similarity) {
+    if (!ai || !input_text || !out || max_out == 0 || ai->kf_count == 0) {
+        if (out && max_out > 0) out[0] = '\0';
+        if (out_match_similarity) *out_match_similarity = 0.0f;
+        return 0;
+    }
+
+    /* 1. Encode input */
+    SpatialGrid* in_grid = grid_create();
+    if (!in_grid) {
+        out[0] = '\0';
+        if (out_match_similarity) *out_match_similarity = 0.0f;
+        return 0;
+    }
+    layers_encode_clause(input_text, NULL, in_grid);
+    update_rgb_directional(in_grid);
+    apply_ema_to_grid(ai, in_grid);
+
+    /* 2. Top-k retrieval (MATCH_GENERATE — B×G precision stage). */
+    MatchContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = &ai->bucket_idx;
+    MatchResult r = spatial_match(ai, in_grid, MATCH_GENERATE, &ctx);
+
+    if (r.topk_count == 0 || r.best_id >= ai->kf_count) {
+        grid_destroy(in_grid);
+        out[0] = '\0';
+        if (out_match_similarity) *out_match_similarity = 0.0f;
+        return 0;
+    }
+    if (out_match_similarity) *out_match_similarity = r.best_score;
+
+    uint32_t ids[TOP_K];
+    float    sc [TOP_K];
+    uint32_t kcount = r.topk_count;
+    for (uint32_t i = 0; i < kcount; i++) {
+        ids[i] = r.topk[i].id;
+        sc [i] = r.topk[i].score;
+    }
+
+    /* 3. Focused AggTables from top-k next-in-topic frames. When no
+     *    topic information is present, next-in-topic degrades to id+1
+     *    which still captures the "temporal successor" of each match. */
+    AggTables* tbl = agg_build_topk(ai, ids, sc, kcount, /*use_next_in_topic*/ 1);
+    if (!tbl) {
+        grid_destroy(in_grid);
+        out[0] = '\0';
+        return 0;
+    }
+
+    /* 4. Initial candidate: row-argmax under agg_score_byte (RGBA only). */
+    InputSignature sig;
+    input_signature_compute(&sig, in_grid);
+
+    SpatialGrid* cand = grid_create();
+    if (!cand) {
+        agg_destroy(tbl);
+        grid_destroy(in_grid);
+        out[0] = '\0';
+        return 0;
+    }
+
+    uint32_t cur_x[GRID_SIZE];
+    for (uint32_t i = 0; i < GRID_SIZE; i++) cur_x[i] = UINT32_MAX;
+
+    for (uint32_t y = 0; y < GRID_SIZE; y++) {
+        if (tbl->row_total_A[y] <= 0.0) continue;
+        double in_R, in_G, in_B;
+        input_signature_get(&sig, y, &in_R, &in_G, &in_B);
+
+        double best_score = 0.0;
+        uint32_t best_x = 0;
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            double s = agg_score_byte(tbl, y, (uint8_t)x, in_R, in_G, in_B);
+            if (s > best_score) { best_score = s; best_x = x; }
+        }
+        if (best_score <= 0.0) continue;
+
+        uint32_t idx = y * GRID_SIZE + best_x;
+        double clipA = best_score > 65535.0 ? 65535.0 : best_score;
+        cand->A[idx] = (uint16_t)clipA;
+        cand->R[idx] = (uint8_t)tbl->R_mean[idx];
+        cand->G[idx] = (uint8_t)tbl->G_mean[idx];
+        cand->B[idx] = (uint8_t)tbl->B_mean[idx];
+        cur_x[y] = best_x;
+    }
+
+    /* 5. Refinement loop — spatial-aware rescoring. */
+    int prev_changed = (int)GRID_SIZE + 1;
+    for (int iter = 0; iter < GEN_REFINE_ITERS; iter++) {
+        int changed = 0;
+        for (uint32_t y = 0; y < GRID_SIZE; y++) {
+            if (tbl->row_total_A[y] <= 0.0) continue;
+            double in_R, in_G, in_B;
+            input_signature_get(&sig, y, &in_R, &in_G, &in_B);
+
+            double best_score = 0.0;
+            uint32_t best_x = 0;
+            for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                double s = agg_score_byte_full(tbl, y, (uint8_t)x,
+                                               in_R, in_G, in_B, cand);
+                if (s > best_score) { best_score = s; best_x = x; }
+            }
+            if (best_score <= 0.0) continue;
+
+            if (cur_x[y] != best_x) {
+                /* Clear previous pick in this row */
+                if (cur_x[y] != UINT32_MAX) {
+                    uint32_t old = y * GRID_SIZE + cur_x[y];
+                    cand->A[old] = 0;
+                    cand->R[old] = 0;
+                    cand->G[old] = 0;
+                    cand->B[old] = 0;
+                }
+                uint32_t idx = y * GRID_SIZE + best_x;
+                double clipA = best_score > 65535.0 ? 65535.0 : best_score;
+                cand->A[idx] = (uint16_t)clipA;
+                cand->R[idx] = (uint8_t)tbl->R_mean[idx];
+                cand->G[idx] = (uint8_t)tbl->G_mean[idx];
+                cand->B[idx] = (uint8_t)tbl->B_mean[idx];
+                cur_x[y] = best_x;
+                changed++;
+            }
+        }
+        if (changed < GEN_REFINE_CONVERGE) break;
+        if (changed >= prev_changed) break;  /* stopped improving */
+        prev_changed = changed;
+    }
+
+    /* 6. Decode. */
+    uint32_t written = grid_decode_text_utf8(cand, out, max_out);
+
+    grid_destroy(cand);
+    grid_destroy(in_grid);
+    agg_destroy(tbl);
+    return written;
 }

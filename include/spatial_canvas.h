@@ -179,4 +179,23 @@ uint32_t       canvas_delta_sparse(const SpatialCanvas* a,
 uint32_t       canvas_delta_rle_bytes(const CanvasDeltaEntry* entries,
                                       uint32_t count);
 
+/* RGBA canvas delta: extended version that carries per-channel diffs
+ * so the caller can reason about semantic (R), role (G) and context
+ * (B) drift between two canvases — not just activation (A). Matches
+ * the keyframe-level DeltaEntry layout. Indexed over CV_TOTAL cells. */
+typedef struct {
+    uint32_t index;    /* y * CV_WIDTH + x */
+    int16_t  diff_A;
+    int8_t   diff_R;
+    int8_t   diff_G;
+    int8_t   diff_B;
+} CanvasDeltaEntryRGB;
+
+/* Compute a per-cell RGBA delta. A cell is emitted whenever ANY of the
+ * four channels differs. Returns the number of entries written. */
+uint32_t       canvas_delta_sparse_rgb(const SpatialCanvas* a,
+                                       const SpatialCanvas* b,
+                                       CanvasDeltaEntryRGB* out,
+                                       uint32_t max_out);
+
 #endif /* SPATIAL_CANVAS_H */

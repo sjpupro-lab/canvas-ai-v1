@@ -156,4 +156,13 @@ uint32_t ai_predict(SpatialAI* ai,
                     const char* input_text,
                     float* out_similarity);
 
+/* Topic-aware "what comes next" for a given keyframe id.
+ * When the matched KF has a non-zero topic, returns the id of the
+ * same-topic KF whose seq_in_topic is the smallest value strictly
+ * greater than the matched KF's seq. When there's no topic or no
+ * successor, falls back to matched_id + 1 (clamped to kf_count - 1).
+ * Returns matched_id unchanged if ai is NULL, empty, or matched_id
+ * is out of range. */
+uint32_t ai_next_in_topic(const SpatialAI* ai, uint32_t matched_id);
+
 #endif /* SPATIAL_KEYFRAME_H */
