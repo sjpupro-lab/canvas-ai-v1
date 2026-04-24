@@ -61,6 +61,16 @@ const uint32_t* subtitle_track_ids_of_type(const SubtitleTrack* t,
 int32_t subtitle_track_find(const SubtitleTrack* t,
                             uint32_t canvas_id, uint32_t slot_id);
 
+/* Remap slot_id for every entry whose canvas_id matches the given one,
+ * using a permutation perm[new_slot] = old_slot (CV_SLOTS entries).
+ *
+ * Must be called after canvas_reorder_slots so SubtitleTrack references
+ * point at the slot's new position. Internally inverts perm then walks
+ * entries — O(CV_SLOTS + entry_count). Unmatched slot_ids (e.g. slots
+ * that weren't placed in perm) are left untouched. */
+void subtitle_track_remap_canvas_slots(SubtitleTrack* t, uint32_t canvas_id,
+                                       const uint32_t* perm);
+
 /* ── SpatialCanvasPool ─────────────────────────────────── */
 
 /* H.264-style scene change detector state (adaptive threshold via EMA).

@@ -160,6 +160,29 @@ uint32_t       canvas_best_slot(const SpatialCanvas* c,
 void           canvas_slot_to_grid(const SpatialCanvas* c, uint32_t slot,
                                    SpatialGrid* out);
 
+/* ── Slot reordering ────────────────────────────────────────
+ *
+ * Greedy 2-opt reorder of occupied slots on the 8×4 grid to minimize
+ * the sum of adjacent-slot dissimilarity. Adjacency follows the canvas
+ * tile layout (52 pairs: 28 horizontal + 24 vertical). Dissimilarity
+ * per pair = (1 - topic_match) + (1 - A_cosine) where topic_match is
+ * 1 when topic_hash is identical, 0 otherwise.
+ *
+ * Purpose:
+ *   - Adjacent-slot clustering makes canvas_update_rgb's cross-boundary
+ *     diffusion meaningful (similar clauses reinforce each other).
+ *   - Canvas-level RLE compression benefits from spatially coherent
+ *     regions.
+ *
+ * Writes the applied permutation as perm[new_slot] = old_slot into
+ * out_perm (must be CV_SLOTS entries). Callers that index data by
+ * slot_id (e.g. SubtitleTrack) must use this to remap their indices;
+ * see subtitle_track_remap_canvas_slots.
+ *
+ * No-op when fewer than 2 slots are occupied. perm still populated as
+ * identity in that case. */
+void           canvas_reorder_slots(SpatialCanvas* c, uint32_t* out_perm);
+
 /* Compute sparse A-delta between two canvases.
  *   Returns number of changed cells; writes index + diff into entries.
  *   Useful for comparing canvas_a → canvas_b (RLE friendliness is

@@ -318,6 +318,181 @@ void canvas_slot_to_grid(const SpatialCanvas* c, uint32_t slot, SpatialGrid* out
     }
 }
 
+/* ── Slot reordering ───────────────────────────────────── */
+
+/* A-channel cosine between two 256×256 tiles on the same canvas. */
+static double canvas_slot_pair_acos(const SpatialCanvas* c, uint32_t s1, uint32_t s2) {
+    if (s1 == s2) return 1.0;
+    uint32_t x1, y1, x2, y2;
+    canvas_slot_byte_offset(s1, &x1, &y1);
+    canvas_slot_byte_offset(s2, &x2, &y2);
+    double dot = 0.0, n1 = 0.0, n2 = 0.0;
+    for (uint32_t dy = 0; dy < CV_TILE; dy++) {
+        for (uint32_t dx = 0; dx < CV_TILE; dx++) {
+            double a = (double)c->A[(y1 + dy) * CV_WIDTH + (x1 + dx)];
+            double b = (double)c->A[(y2 + dy) * CV_WIDTH + (x2 + dx)];
+            dot += a * b;
+            n1  += a * a;
+            n2  += b * b;
+        }
+    }
+    if (n1 <= 0.0 || n2 <= 0.0) return 0.0;
+    double cos = dot / (sqrt(n1) * sqrt(n2));
+    if (cos < 0.0) cos = 0.0;
+    if (cos > 1.0) cos = 1.0;
+    return cos;
+}
+
+/* Pairwise dissimilarity ∈ [0, 2]: topic mismatch contributes 1,
+ * (1 - A_cosine) contributes 1. Unoccupied slots are treated as
+ * maximally dissimilar to every occupied slot so they sink to the end. */
+static double canvas_slot_pair_cost(const SpatialCanvas* c, uint32_t s1, uint32_t s2) {
+    int o1 = c->meta[s1].occupied;
+    int o2 = c->meta[s2].occupied;
+    if (!o1 && !o2) return 0.0;
+    if (!o1 || !o2) return 2.0;
+    double topic_cost = (c->meta[s1].topic_hash == c->meta[s2].topic_hash) ? 0.0 : 1.0;
+    double a_cos = canvas_slot_pair_acos(c, s1, s2);
+    return topic_cost + (1.0 - a_cos);
+}
+
+/* Sum of dissimilarity over all adjacent slot pairs in the 8×4 grid.
+ * Adjacency is defined as horizontal (same row, adjacent cols) + vertical
+ * (same col, adjacent rows) — 28 + 24 = 52 pairs for 8×4. The `perm`
+ * maps logical position → current slot id, so perm[k] tells us which
+ * slot sits at position k.
+ *
+ * Costs are computed via the PAIRWISE COST CACHE (`pair_cost`) that is
+ * keyed by slot-id (NOT logical position), so a permutation applies by
+ * indexing the cache with perm[pos1] / perm[pos2] rather than
+ * recomputing A-channel cosines. */
+static double reorder_total_cost(const double* pair_cost,
+                                 const uint32_t* perm) {
+    double total = 0.0;
+    for (uint32_t r = 0; r < CV_ROWS; r++) {
+        for (uint32_t col = 0; col < CV_COLS; col++) {
+            uint32_t pos = r * CV_COLS + col;
+            uint32_t s1  = perm[pos];
+            if (col + 1 < CV_COLS) {
+                uint32_t s2 = perm[r * CV_COLS + col + 1];
+                total += pair_cost[s1 * CV_SLOTS + s2];
+            }
+            if (r + 1 < CV_ROWS) {
+                uint32_t s2 = perm[(r + 1) * CV_COLS + col];
+                total += pair_cost[s1 * CV_SLOTS + s2];
+            }
+        }
+    }
+    return total;
+}
+
+void canvas_reorder_slots(SpatialCanvas* c, uint32_t* out_perm) {
+    if (!c || !out_perm) return;
+
+    /* Identity permutation by default. */
+    for (uint32_t i = 0; i < CV_SLOTS; i++) out_perm[i] = i;
+
+    /* Nothing to do with <2 occupied slots. */
+    uint32_t occ = 0;
+    for (uint32_t i = 0; i < CV_SLOTS; i++) if (c->meta[i].occupied) occ++;
+    if (occ < 2) return;
+
+    /* Pairwise cost cache — CV_SLOTS² = 1024 entries, keyed by slot id. */
+    double* pair_cost = (double*)malloc(CV_SLOTS * CV_SLOTS * sizeof(double));
+    if (!pair_cost) return;
+    for (uint32_t i = 0; i < CV_SLOTS; i++) {
+        pair_cost[i * CV_SLOTS + i] = 0.0;
+        for (uint32_t j = i + 1; j < CV_SLOTS; j++) {
+            double cst = canvas_slot_pair_cost(c, i, j);
+            pair_cost[i * CV_SLOTS + j] = cst;
+            pair_cost[j * CV_SLOTS + i] = cst;
+        }
+    }
+
+    /* Greedy 2-opt: iterate until no improving swap exists (or 8 sweeps,
+     * whichever comes first). Each sweep is O(CV_SLOTS² × 4) since
+     * evaluating a swap only needs to look at the ≤4 adjacency edges
+     * touching each of the two swapped positions — but we just
+     * recompute full total cost for clarity (52 adds is negligible).
+     *
+     * This is suboptimal vs Hungarian / simulated annealing but the
+     * 32-slot search space makes the greedy sufficient in practice and
+     * keeps the code under 40 lines. */
+    uint32_t perm[CV_SLOTS];
+    memcpy(perm, out_perm, sizeof(perm));
+
+    double best_cost = reorder_total_cost(pair_cost, perm);
+    int improved = 1;
+    int sweeps = 0;
+    while (improved && sweeps < 8) {
+        improved = 0;
+        sweeps++;
+        for (uint32_t i = 0; i < CV_SLOTS; i++) {
+            for (uint32_t j = i + 1; j < CV_SLOTS; j++) {
+                uint32_t tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+                double c_new = reorder_total_cost(pair_cost, perm);
+                if (c_new + 1e-9 < best_cost) {
+                    best_cost = c_new;
+                    improved = 1;
+                    /* keep the swap */
+                } else {
+                    /* revert */
+                    tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp;
+                }
+            }
+        }
+    }
+    free(pair_cost);
+
+    /* If perm is identity, nothing to do. */
+    int identity = 1;
+    for (uint32_t i = 0; i < CV_SLOTS; i++) {
+        if (perm[i] != i) { identity = 0; break; }
+    }
+    if (identity) return;
+
+    /* Apply the permutation physically:
+     *   new_canvas[pos=k] = old_canvas[slot=perm[k]]
+     * Need a scratch buffer holding every tile + meta before overwriting
+     * since swaps may form cycles. */
+    uint16_t* scratch_A = (uint16_t*)malloc(CV_TOTAL * sizeof(uint16_t));
+    uint8_t*  scratch_R = (uint8_t*)malloc(CV_TOTAL);
+    uint8_t*  scratch_G = (uint8_t*)malloc(CV_TOTAL);
+    uint8_t*  scratch_B = (uint8_t*)malloc(CV_TOTAL);
+    SlotMeta  meta_copy[CV_SLOTS];
+    if (!scratch_A || !scratch_R || !scratch_G || !scratch_B) {
+        free(scratch_A); free(scratch_R); free(scratch_G); free(scratch_B);
+        return;
+    }
+    memcpy(scratch_A, c->A, CV_TOTAL * sizeof(uint16_t));
+    memcpy(scratch_R, c->R, CV_TOTAL);
+    memcpy(scratch_G, c->G, CV_TOTAL);
+    memcpy(scratch_B, c->B, CV_TOTAL);
+    memcpy(meta_copy, c->meta, sizeof(meta_copy));
+
+    for (uint32_t k = 0; k < CV_SLOTS; k++) {
+        uint32_t src = perm[k];
+        if (src == k) continue;
+        uint32_t sx0, sy0, dx0, dy0;
+        canvas_slot_byte_offset(src, &sx0, &sy0);
+        canvas_slot_byte_offset(k,   &dx0, &dy0);
+        for (uint32_t dy = 0; dy < CV_TILE; dy++) {
+            for (uint32_t dx = 0; dx < CV_TILE; dx++) {
+                uint32_t si = (sy0 + dy) * CV_WIDTH + (sx0 + dx);
+                uint32_t di = (dy0 + dy) * CV_WIDTH + (dx0 + dx);
+                c->A[di] = scratch_A[si];
+                c->R[di] = scratch_R[si];
+                c->G[di] = scratch_G[si];
+                c->B[di] = scratch_B[si];
+            }
+        }
+        c->meta[k] = meta_copy[src];
+    }
+
+    free(scratch_A); free(scratch_R); free(scratch_G); free(scratch_B);
+    memcpy(out_perm, perm, sizeof(perm));
+}
+
 /* ── Slot matching ─────────────────────────────────────── */
 
 float canvas_match_slot(const SpatialCanvas* c, const SpatialGrid* query, uint32_t slot) {

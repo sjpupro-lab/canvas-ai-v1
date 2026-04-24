@@ -100,6 +100,25 @@ int32_t subtitle_track_find(const SubtitleTrack* t,
     return -1;
 }
 
+void subtitle_track_remap_canvas_slots(SubtitleTrack* t, uint32_t canvas_id,
+                                       const uint32_t* perm) {
+    if (!t || !perm) return;
+    /* Invert perm: inv[old_slot] = new_slot. */
+    uint32_t inv[CV_SLOTS];
+    for (uint32_t i = 0; i < CV_SLOTS; i++) inv[i] = UINT32_MAX;
+    for (uint32_t new_pos = 0; new_pos < CV_SLOTS; new_pos++) {
+        uint32_t old_slot = perm[new_pos];
+        if (old_slot < CV_SLOTS) inv[old_slot] = new_pos;
+    }
+    for (uint32_t i = 0; i < t->count; i++) {
+        SubtitleEntry* e = &t->entries[i];
+        if (e->canvas_id != canvas_id) continue;
+        if (e->slot_id >= CV_SLOTS) continue;
+        uint32_t mapped = inv[e->slot_id];
+        if (mapped != UINT32_MAX) e->slot_id = mapped;
+    }
+}
+
 /* ── Slot-level scoring primitives ─────────────────────── */
 
 float canvas_slot_cosine_a(const SpatialCanvas* c, uint32_t slot,
@@ -317,9 +336,19 @@ int pool_add_clause(SpatialCanvasPool* p, const char* text) {
     uint32_t entry_id = subtitle_track_add(&p->track, type, th,
                                            (uint32_t)cvi, (uint32_t)slot, len);
 
-    /* If this placement filled the canvas, run scene-change classification
-     * so future matching / compression can rely on I/P labels. */
+    /* If this placement filled the canvas:
+     *   (1) Reorder slots so topic-adjacent clauses sit next to each
+     *       other. canvas_update_rgb's cross-boundary diffusion then
+     *       reinforces similar content; RLE on the canvas-level A delta
+     *       also benefits from spatial coherence. Track references to
+     *       (canvas_id, slot_id) are remapped via the returned perm.
+     *   (2) Run scene-change classification for I/P labelling so future
+     *       matching / compression can rely on it. */
     if (c->slot_count == CV_SLOTS && !c->classified) {
+        uint32_t perm[CV_SLOTS];
+        canvas_reorder_slots(c, perm);
+        subtitle_track_remap_canvas_slots(&p->track, (uint32_t)cvi, perm);
+
         /* Gather same-type IFRAME canvases (excluding the candidate). */
         SpatialCanvas** refs = (SpatialCanvas**)malloc(p->count * sizeof(SpatialCanvas*));
         uint32_t n_refs = 0;

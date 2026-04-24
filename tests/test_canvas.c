@@ -248,6 +248,134 @@ static void test_canvas_vs_independent(void) {
     PASS();
 }
 
+/* ── Slot reorder: scrambled topic input clusters after reorder ── */
+
+/* Sum of (1 - A_cosine) over all 52 adjacent slot pairs. Lower = more
+ * spatially coherent canvas. topic_hash here is unique per clause (djb2
+ * of full text) so we can't rely on topic equality — A-cosine measures
+ * the actual signal the reorder optimizes. */
+static double sum_adjacent_a_cost(const SpatialCanvas* c) {
+    double total = 0.0;
+    for (uint32_t r = 0; r < CV_ROWS; r++) {
+        for (uint32_t col = 0; col < CV_COLS; col++) {
+            uint32_t s1 = r * CV_COLS + col;
+            uint32_t x1, y1; canvas_slot_byte_offset(s1, &x1, &y1);
+            uint32_t pairs[2], np = 0;
+            if (col + 1 < CV_COLS) pairs[np++] = r * CV_COLS + col + 1;
+            if (r + 1 < CV_ROWS)   pairs[np++] = (r + 1) * CV_COLS + col;
+            for (uint32_t k = 0; k < np; k++) {
+                uint32_t s2 = pairs[k];
+                uint32_t x2, y2; canvas_slot_byte_offset(s2, &x2, &y2);
+                double dot = 0, n1 = 0, n2 = 0;
+                for (uint32_t dy = 0; dy < CV_TILE; dy++)
+                    for (uint32_t dx = 0; dx < CV_TILE; dx++) {
+                        double a = c->A[(y1 + dy) * CV_WIDTH + (x1 + dx)];
+                        double b = c->A[(y2 + dy) * CV_WIDTH + (x2 + dx)];
+                        dot += a * b; n1 += a * a; n2 += b * b;
+                    }
+                double cos = (n1 > 0 && n2 > 0) ? dot / (sqrt(n1) * sqrt(n2)) : 0.0;
+                if (cos > 1.0) cos = 1.0;
+                if (cos < 0.0) cos = 0.0;
+                total += (1.0 - cos);
+            }
+        }
+    }
+    return total;
+}
+
+static void test_slot_reorder_groups_by_topic(void) {
+    TEST("canvas_reorder_slots groups same-topic slots adjacent");
+
+    SpatialCanvas* c = canvas_create();
+    assert(c);
+
+    /* 32 clauses alternating 4 topics round-robin, so initial placement
+     * is heavily scrambled: adjacent slots nearly always differ. */
+    const char* T[4][8] = {
+        {"cat eats bread","dog eats bread","fox eats bread","bear eats bread",
+         "owl eats bread","ant eats bread","bat eats bread","pig eats bread"},
+        {"cat drinks water","dog drinks water","fox drinks water","bear drinks water",
+         "owl drinks water","ant drinks water","bat drinks water","pig drinks water"},
+        {"cat reads book","dog reads book","fox reads book","bear reads book",
+         "owl reads book","ant reads book","bat reads book","pig reads book"},
+        {"cat runs road","dog runs road","fox runs road","bear runs road",
+         "owl runs road","ant runs road","bat runs road","pig runs road"},
+    };
+    uint32_t counters[4] = {0};
+    for (uint32_t i = 0; i < CV_SLOTS; i++) {
+        uint32_t topic = i % 4;          /* round-robin → scrambled */
+        const char* txt = T[topic][counters[topic]++];
+        int slot = canvas_add_clause(c, txt);
+        assert(slot == (int)i);
+    }
+    assert(c->slot_count == CV_SLOTS);
+
+    double before = sum_adjacent_a_cost(c);
+
+    uint32_t perm[CV_SLOTS];
+    canvas_reorder_slots(c, perm);
+
+    double after = sum_adjacent_a_cost(c);
+    printf("\n    adjacent A-cost (52 pairs): before=%.2f  after=%.2f  (improvement=%.2f)\n",
+           before, after, before - after);
+    assert(after < before);
+
+    /* perm must be a valid permutation of [0..CV_SLOTS). */
+    int seen[CV_SLOTS] = {0};
+    for (uint32_t i = 0; i < CV_SLOTS; i++) {
+        assert(perm[i] < CV_SLOTS);
+        assert(!seen[perm[i]]);
+        seen[perm[i]] = 1;
+    }
+
+    /* Content invariant: the 32 distinct topic_hashes on the canvas
+     * must be preserved — reorder permutes slots, doesn't drop any.
+     * (canvas_add_clause uses djb2(full text) so every clause has its
+     * own hash.) */
+    uint32_t distinct_hashes[CV_SLOTS]; uint32_t ndh = 0;
+    for (uint32_t i = 0; i < CV_SLOTS; i++) {
+        uint32_t h = c->meta[i].topic_hash;
+        int known = 0;
+        for (uint32_t j = 0; j < ndh; j++) {
+            if (distinct_hashes[j] == h) { known = 1; break; }
+        }
+        if (!known) distinct_hashes[ndh++] = h;
+    }
+    assert(ndh == CV_SLOTS);   /* all 32 distinct clauses still present */
+
+    canvas_destroy(c);
+    PASS();
+}
+
+/* ── Slot reorder: single-topic canvas leaves slots unchanged ── */
+
+static void test_slot_reorder_noop_on_identical(void) {
+    TEST("canvas_reorder_slots is identity when every slot is identical");
+
+    SpatialCanvas* c = canvas_create();
+    assert(c);
+    /* Same text 32 times → identical topic_hash, identical tile, zero
+     * pairwise cost in every direction. Greedy 2-opt must reject every
+     * candidate swap (cost never strictly decreases) and return identity. */
+    for (uint32_t i = 0; i < CV_SLOTS; i++) {
+        canvas_add_clause(c, "cat eats bread");
+    }
+
+    uint16_t* snap = (uint16_t*)malloc(CV_TOTAL * sizeof(uint16_t));
+    memcpy(snap, c->A, CV_TOTAL * sizeof(uint16_t));
+
+    uint32_t perm[CV_SLOTS];
+    canvas_reorder_slots(c, perm);
+
+    for (uint32_t i = 0; i < CV_SLOTS; i++) assert(perm[i] == i);
+    int diff = memcmp(snap, c->A, CV_TOTAL * sizeof(uint16_t));
+    assert(diff == 0);
+
+    free(snap);
+    canvas_destroy(c);
+    PASS();
+}
+
 int main(void) {
     printf("=== test_canvas ===\n");
 
@@ -257,6 +385,8 @@ int main(void) {
     test_slot_matching();
     test_delta_rle_benefit();
     test_canvas_vs_independent();
+    test_slot_reorder_groups_by_topic();
+    test_slot_reorder_noop_on_identical();
 
     printf("  %d/%d passed\n\n", tests_passed, tests_total);
     return (tests_passed == tests_total) ? 0 : 1;
